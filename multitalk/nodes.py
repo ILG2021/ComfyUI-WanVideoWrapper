@@ -409,6 +409,8 @@ class WanVideoImageToVideoMultiTalk:
                     "multitalk",
                     "infinitetalk"
                 ], {"default": "auto", "tooltip": "The sampling strategy to use in the long video generation loop, should match the model used"}),
+                "tiny_vae": ("BOOLEAN", {"default": False, "tooltip": "Use TAEHV TinyVAE for window decoding. Requires taew2_1.safetensors in models/vae_approx."}),
+                "reuse_motion_latent": ("BOOLEAN", {"default": True, "tooltip": "Reuse the previous window's motion latent instead of re-encoding cond_frame."}),
                 "output_path": ("STRING", {"default": "", "tooltip": "If set, will save each window's resulting frames to this folder, also DISABLES returning the final video tensor to save memory"}),
 
             }
@@ -420,7 +422,7 @@ class WanVideoImageToVideoMultiTalk:
     CATEGORY = "WanVideoWrapper"
     DESCRIPTION = "Enables Multi/InfiniteTalk long video generation sampling method, the video is created in windows with overlapping frames. Not compatible or necessary to be used with context windows and many other features besides Multi/InfiniteTalk."
 
-    def process(self, vae, width, height, frame_window_size, motion_frame, force_offload, colormatch, start_image=None, tiled_vae=False, clip_embeds=None, mode="multitalk", output_path=""):
+    def process(self, vae, width, height, frame_window_size, motion_frame, force_offload, colormatch, start_image=None, tiled_vae=False, clip_embeds=None, mode="multitalk", tiny_vae=False, reuse_motion_latent=True, output_path=""):
 
         H = height
         W = width
@@ -451,6 +453,8 @@ class WanVideoImageToVideoMultiTalk:
             "target_h": H,
             "target_w": W,
             "tiled_vae": tiled_vae,
+            "tiny_vae": tiny_vae,
+            "reuse_motion_latent": reuse_motion_latent,
             "force_offload": force_offload,
             "vae": vae,
             "target_shape": target_shape,

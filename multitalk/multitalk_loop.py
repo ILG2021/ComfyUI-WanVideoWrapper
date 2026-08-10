@@ -8,8 +8,10 @@ from ..wanvideo.schedulers import get_scheduler
 from .multitalk import timestep_transform, add_noise
 from ..utils import log, print_memory, temporal_score_rescaling, offload_transformer, init_blockswap, match_and_blend_colors
 from comfy.utils import load_torch_file
+import folder_paths
 from ..nodes_model_loading import load_weights
 from ..HuMo.nodes import get_audio_emb_window
+from ..taehv import TAEHV
 import comfy.model_management as mm
 from tqdm import tqdm
 import copy
@@ -21,6 +23,29 @@ script_directory = os.path.dirname(os.path.abspath(__file__))
 
 device = mm.get_torch_device()
 offload_device = mm.unet_offload_device()
+_tiny_vae = None
+_tiny_vae_path = None
+
+
+def _get_tiny_vae(device):
+    global _tiny_vae, _tiny_vae_path
+
+    tiny_vae_path = folder_paths.get_full_path("vae_approx", "taew2_1.safetensors")
+    if tiny_vae_path is None:
+        raise FileNotFoundError(
+            "TinyVAE file not found. Put taew2_1.safetensors in models/vae_approx."
+        )
+
+    if _tiny_vae is None or _tiny_vae_path != tiny_vae_path:
+        log.info("Loading InfiniteTalk TinyVAE: %s", tiny_vae_path)
+        state_dict = load_torch_file(tiny_vae_path)
+        _tiny_vae = TAEHV(state_dict, dtype=torch.float16, model_name="taew2_1")
+        _tiny_vae.eval().to(device)
+        _tiny_vae_path = tiny_vae_path
+    elif next(_tiny_vae.parameters()).device != device:
+        _tiny_vae.to(device)
+
+    return _tiny_vae
 
 def multitalk_loop(self, **kwargs):
     # Unpack kwargs into local variables
@@ -59,6 +84,8 @@ def multitalk_loop(self, **kwargs):
     offload = image_embeds.get("force_offload", False)
     offloaded = False
     tiled_vae = image_embeds.get("tiled_vae", False)
+    tiny_vae = image_embeds.get("tiny_vae", False)
+    reuse_motion_latent = image_embeds.get("reuse_motion_latent", True)
     frame_num = clip_length = image_embeds.get("frame_window_size", 81)
 
     clip_embeds = image_embeds.get("clip_context", None)
@@ -102,6 +129,7 @@ def multitalk_loop(self, **kwargs):
     audio_embedding = multitalk_audio_embeds
     human_num = len(audio_embedding)
     audio_embs = None
+    next_motion_latent = None
 
     uni3c_data = None
     if uni3c_embeds is not None:
@@ -273,7 +301,10 @@ def multitalk_loop(self, **kwargs):
 
             if mode == "infinitetalk":
                 cond_ = cond_image if is_first_clip else cond_frame
-                latent_motion_frames = vae.encode(cond_.to(device, vae.dtype), device=device, tiled=tiled_vae, pbar=False).to(dtype)[0]
+                if reuse_motion_latent and not is_first_clip and next_motion_latent is not None:
+                    latent_motion_frames = next_motion_latent.to(device=device, dtype=dtype)
+                else:
+                    latent_motion_frames = vae.encode(cond_.to(device, vae.dtype), device=device, tiled=tiled_vae, pbar=False).to(dtype)[0]
             else:
                 latent_motion_frames = y[:, :cur_motion_frames_latent_num] # C T H W
 
@@ -465,9 +496,28 @@ def multitalk_loop(self, **kwargs):
         if humo_image_cond is not None and humo_reference_count > 0:
             latent = latent[:,:-humo_reference_count]
 
-        vae.to(device)
-        videos = vae.decode(latent.unsqueeze(0).to(device, vae.dtype), device=device, tiled=tiled_vae, pbar=False)[0].cpu()
-        vae.to(offload_device)
+        # Reuse the sampled latent tail as the next InfiniteTalk motion
+        # reference. The decoded cond_frame below is still needed for the
+        # next window's pixel-space image condition y.
+        if mode == "infinitetalk" and reuse_motion_latent and not arrive_last_frame:
+            next_motion_latent_num = 1 + (motion_frame - 1) // 4
+            next_motion_latent = latent[:, -next_motion_latent_num:].detach().clone()
+
+        if tiny_vae:
+            tiny_vae_model = _get_tiny_vae(device)
+            # TAEHV uses NTCHW input/output, while WanVideo uses CT HW here.
+            tiny_input = latent.to(device=device, dtype=tiny_vae_model.dtype).unsqueeze(0).permute(0, 2, 1, 3, 4)
+            with torch.inference_mode():
+                videos = tiny_vae_model.decode_video(
+                    tiny_input,
+                    parallel=False,
+                    show_progress_bar=False,
+                )[0]
+            videos = videos.permute(1, 0, 2, 3).mul(2.0).sub(1.0).cpu()
+        else:
+            vae.to(device)
+            videos = vae.decode(latent.unsqueeze(0).to(device, vae.dtype), device=device, tiled=tiled_vae, pbar=False)[0].cpu()
+            vae.to(offload_device)
 
         sampling_pbar.close()
 
